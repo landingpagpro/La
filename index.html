@@ -1,0 +1,2127 @@
+
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js",
+    "start": "NODE_ENV=production node server.js",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0",
+    "express": "^4.21.2",
+    "dotenv": "^17.2.3",
+    "motion": "^12.23.24"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "@types/express": "^4.17.21"
+  }
+}# GEMINI_API_KEY: Required for Gemini AI API calls.
+# AI Studio automatically injects this at runtime from user secrets.
+# Users configure this via the Secrets panel in the AI Studio UI.
+GEMINI_API_KEY="MY_GEMINI_API_KEY"
+
+# APP_URL: The URL where this applet is hosted.
+# AI Studio automatically injects this at runtime with the Cloud Run service URL.
+# Used for self-referential links, OAuth callbacks, and API endpoints.
+APP_URL="MY_APP_URL"import express from 'express';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = 3000;
+const isProd = process.env.NODE_ENV === 'production';
+
+function getAiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is not configured in environment.');
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+const SCENARIO_CONTEXT: Record<string, string> = {
+  conversation:
+    'Open everyday English conversation on any topic the learner chooses. Keep the tone warm, natural, and engaging.',
+  airport:
+    'At an American airport (check-in desk, security, boarding gate, baggage claim). Act as a helpful travel partner or airport staff member.',
+  work:
+    'At an American workplace / office. Act as a friendly coworker chatting before a meeting, discussing tasks, deadlines, and teamwork.',
+  doctor:
+    'At an American clinic / doctor visit. Act as a warm, reassuring doctor asking about symptoms and explaining next steps clearly.',
+  meeting:
+    'Meeting someone new at a casual social gathering. Act as a friendly conversation partner who enjoys making new friends and learning about different cultures.',
+};
+
+const LEVEL_INSTRUCTIONS: Record<string, string> = {
+  beginner:
+    'BEGINNER (A1-A2): Use very simple, high-frequency English words and short sentences (1-2 short sentences max). Avoid complex idioms or slang. Speak gently and patiently.',
+  intermediate:
+    'INTERMEDIATE (B1-B2): Use natural everyday conversational American English, common phrasal verbs, and 2-3 friendly sentences. Ask engaging follow-up questions.',
+  advanced:
+    'ADVANCED (C1-C2): Use authentic, idiomatic American English with natural expressions, subtle humor, and rich conversational depth.',
+};
+
+async function startServer() {
+  const app = express();
+  app.use(express.json({ limit: '15mb' }));
+
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
+
+  // Helper to parse structured section stream from /api/chat/stream
+  function parseStreamedSections(raw: string) {
+    const extract = (tag: string, nextTags: string[]) => {
+      const idx = raw.indexOf(tag);
+      if (idx === -1) return '';
+      const start = idx + tag.length;
+      let end = raw.length;
+      for (const nt of nextTags) {
+        const nIdx = raw.indexOf(nt, start);
+        if (nIdx !== -1 && nIdx < end) {
+          end = nIdx;
+        }
+      }
+      return raw.slice(start, end).trim();
+    };
+
+    const replyEnglishRaw = extract('[REPLY]', ['[MISTAKE]', '[CORRECTED]', '[EXPLAIN]', '[TRANS]', '[HINT]']);
+    const replyEnglish =
+      replyEnglishRaw ||
+      (raw.indexOf('[REPLY]') === -1
+        ? raw.split(/\[(?:MISTAKE|CORRECTED|EXPLAIN|TRANS|HINT)\]/)[0].trim()
+        : '');
+    const mistakeFlag = extract('[MISTAKE]', ['[CORRECTED]', '[EXPLAIN]', '[TRANS]', '[HINT]']).toUpperCase();
+    const correctedEnglish = extract('[CORRECTED]', ['[EXPLAIN]', '[TRANS]', '[HINT]']);
+    const explanation = extract('[EXPLAIN]', ['[TRANS]', '[HINT]']);
+    const replyTranslation = extract('[TRANS]', ['[HINT]']);
+    const suggestedNextReply = extract('[HINT]', []);
+
+    const hasMistake =
+      mistakeFlag.startsWith('YES') ||
+      mistakeFlag.startsWith('TRUE') ||
+      (correctedEnglish.length > 0 && correctedEnglish.toLowerCase() !== 'none');
+
+    return {
+      hasMistake,
+      correctedEnglish: hasMistake && correctedEnglish.toLowerCase() !== 'none' ? correctedEnglish : '',
+      explanation: hasMistake && explanation.toLowerCase() !== 'none' ? explanation : '',
+      replyEnglish,
+      replyTranslation,
+      suggestedNextReply,
+    };
+  }
+
+  function buildChatPrompts(
+    scenarioId: string,
+    level: string,
+    history: Array<{ sender: 'user' | 'alex'; text: string }>,
+    userMessage: string
+  ) {
+    const scenarioInfo = SCENARIO_CONTEXT[scenarioId] || SCENARIO_CONTEXT.conversation;
+    const levelInfo = LEVEL_INSTRUCTIONS[level] || LEVEL_INSTRUCTIONS.beginner;
+    const formattedHistory = (history || [])
+      .slice(-2)
+      .map((m) => `${m.sender === 'user' ? 'L' : 'P'}: ${String(m.text || '').slice(0, 160)}`)
+      .join('\n');
+
+    const safeMessage = userMessage.trim().slice(0, 1000);
+    const prompt = `${formattedHistory ? `${formattedHistory}\n` : ''}L: "${safeMessage}"`;
+    return { scenarioInfo, levelInfo, prompt };
+  }
+
+  // 1A. Streaming Conversational Chat (SSE)
+  app.post('/api/chat/stream', async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Content-Encoding', 'identity');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    // Establish stream immediately across reverse proxies to avoid buffering/timeout drops
+    res.write(': connected\n\n');
+
+    let clientClosed = false;
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+      }
+    });
+
+    try {
+      const { scenarioId, level, history, userMessage, targetLanguageName } = req.body as {
+        scenarioId: string;
+        level: string;
+        history: Array<{ sender: 'user' | 'alex'; text: string }>;
+        userMessage: string;
+        targetLanguageName?: string;
+      };
+
+      if (!userMessage || typeof userMessage !== 'string' || !userMessage.trim()) {
+        res.write(`data: ${JSON.stringify({ type: 'error', error: 'Message text is required.' })}\n\n`);
+        return res.end();
+      }
+
+      const ai = getAiClient();
+      const { scenarioInfo, levelInfo, prompt } = buildChatPrompts(scenarioId, level, history, userMessage);
+      const transLang = targetLanguageName?.trim();
+      const transMarkerInstruction = transLang
+        ? `[TRANS]\nAccurate natural translation of [REPLY] into ${transLang}\n`
+        : '';
+
+      const systemInstruction = `You are a friendly American English conversation partner in "Learn English via Conversation".
+Context: ${scenarioInfo}
+Level: ${levelInfo}
+Rules:
+- Reply directly to what the learner actually asked or said. Follow their topic even if it changes (sports, science, culture, religion, daily life).
+- If they write broken English or mix another language, understand their intent, answer directly in English, and teach the natural English phrasing in [CORRECTED] + [EXPLAIN].
+- Keep [REPLY] concise (1-2 short natural sentences + 1 short follow-up question).
+
+Use ONLY these exact markers in order, starting immediately with [REPLY]:
+[REPLY]
+Your direct English reply
+[MISTAKE]
+YES or NO (ignore minor punctuation/capitalization; if NO, omit [CORRECTED] and [EXPLAIN])
+[CORRECTED]
+Natural English version of learner's message (only if YES)
+[EXPLAIN]
+1 short simple-English tip (only if YES)
+${transMarkerInstruction}[HINT]
+1 short English reply the learner can say next`;
+
+      const withTimeout = <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+        let timer: NodeJS.Timeout;
+        const timeoutPromise = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`Timeout (${ms}ms): ${label}`)), ms);
+        });
+        return Promise.race([
+          promise.finally(() => clearTimeout(timer)),
+          timeoutPromise,
+        ]);
+      };
+
+      type StreamIter = AsyncIterator<
+        Awaited<ReturnType<typeof ai.models.generateContentStream>> extends AsyncIterable<infer U> ? U : never
+      >;
+      type StreamStep = IteratorResult<
+        Awaited<ReturnType<typeof ai.models.generateContentStream>> extends AsyncIterable<infer U> ? U : never
+      >;
+
+      let fullText = '';
+      let lastSentReply = '';
+      let replyCompletedSent = false;
+      let succeeded = false;
+
+      // Keep proxy stream alive while waiting for model tokens
+      const keepaliveInterval = setInterval(() => {
+        if (!clientClosed && !res.writableEnded) {
+          res.write(': ping\n\n');
+        }
+      }, 1000);
+
+      let activeIter: StreamIter | null = null;
+      try {
+        const winner = await withTimeout(
+          new Promise<{ iter: StreamIter; firstStep: StreamStep }>((resolve, reject) => {
+            let settled = false;
+            let hedgeStarted = false;
+            let failures = 0;
+            let lastErr: unknown = null;
+            let hedgeTimer: NodeJS.Timeout | null = null;
+
+            const launch = (model: string, thinkingLevel: ThinkingLevel) => {
+              ai.models
+                .generateContentStream({
+                  model,
+                  contents: prompt,
+                  config: {
+                    systemInstruction,
+                    thinkingConfig: { thinkingLevel },
+                  },
+                })
+                .then(async (stream) => {
+                  const iter: StreamIter = stream[Symbol.asyncIterator]();
+                  const firstStep = await iter.next();
+                  if (settled || clientClosed) {
+                    iter.return?.().catch(() => {});
+                    return;
+                  }
+                  settled = true;
+                  if (hedgeTimer) clearTimeout(hedgeTimer);
+                  resolve({ iter, firstStep });
+                })
+                .catch((err: unknown) => {
+                  lastErr = err;
+                  failures += 1;
+                  if (settled) return;
+                  if (!hedgeStarted) {
+                    hedgeStarted = true;
+                    if (hedgeTimer) clearTimeout(hedgeTimer);
+                    launch('gemini-4-hydrogen', ThinkingLevel.LOW);
+                  } else if (failures >= 2) {
+                    settled = true;
+                    if (hedgeTimer) clearTimeout(hedgeTimer);
+                    reject(lastErr || new Error('Service temporarily busy.'));
+                  }
+                });
+            };
+
+            launch('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
+            hedgeTimer = setTimeout(() => {
+              if (!settled && !hedgeStarted && !clientClosed) {
+                hedgeStarted = true;
+                launch('gemini-4-hydrogen', ThinkingLevel.LOW);
+              }
+            }, 2400);
+          }),
+          9500,
+          'chat stream first chunk'
+        );
+
+        activeIter = winner.iter;
+        let step = winner.firstStep;
+
+        while (!step.done) {
+          if (clientClosed) break;
+          const chunk = step.value;
+          const piece = chunk.text ?? '';
+          if (piece) {
+            fullText += piece;
+
+            const replyStart = fullText.indexOf('[REPLY]');
+            if (replyStart !== -1) {
+              let afterTag = fullText.slice(replyStart + '[REPLY]'.length);
+              const nextMarkerIdx = afterTag.search(/\n?\[(?:MISTAKE|CORRECTED|EXPLAIN|TRANS|HINT)\]/);
+              if (nextMarkerIdx !== -1) {
+                afterTag = afterTag.slice(0, nextMarkerIdx);
+                const finalReplyChunk = afterTag.replace(/^\s+/, '').trim();
+                if (!replyCompletedSent && finalReplyChunk) {
+                  replyCompletedSent = true;
+                  lastSentReply = finalReplyChunk;
+                  res.write(`data: ${JSON.stringify({ type: 'reply_complete', replyEnglish: finalReplyChunk })}\n\n`);
+                }
+              } else {
+                // Strip any partial marker prefix at the very end so raw tags never flicker
+                afterTag = afterTag.replace(/\n?\[[A-Z_]{0,12}$/, '');
+                const cleanReply = afterTag.replace(/^\s+/, '');
+                if (cleanReply && cleanReply.length > lastSentReply.length && cleanReply.startsWith(lastSentReply)) {
+                  const delta = cleanReply.slice(lastSentReply.length);
+                  lastSentReply = cleanReply;
+                  res.write(`data: ${JSON.stringify({ type: 'reply_delta', delta })}\n\n`);
+                } else if (cleanReply && cleanReply !== lastSentReply) {
+                  lastSentReply = cleanReply;
+                  res.write(`data: ${JSON.stringify({ type: 'reply', replyEnglish: cleanReply })}\n\n`);
+                }
+              }
+            }
+          }
+          step = await withTimeout(activeIter.next(), 4500, 'chat stream next chunk');
+        }
+
+        succeeded = true;
+      } catch (err: unknown) {
+        activeIter?.return?.().catch(() => {});
+        if (!clientClosed) {
+          throw err;
+        }
+      } finally {
+        clearInterval(keepaliveInterval);
+      }
+
+      if (clientClosed) {
+        return res.end();
+      }
+
+      if (!succeeded) {
+        throw new Error('Service temporarily busy.');
+      }
+
+      const parsed = parseStreamedSections(fullText);
+      if (!parsed.replyEnglish && lastSentReply) {
+        parsed.replyEnglish = lastSentReply;
+      }
+
+      res.write(`data: ${JSON.stringify({ type: 'done', ...parsed })}\n\n`);
+      return res.end();
+    } catch (err: unknown) {
+      console.error('Chat stream error:', err);
+      const rawMsg = err instanceof Error ? err.message : '';
+      const isBusy = rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE') || rawMsg.includes('429');
+      const friendlyMsg = isBusy
+        ? 'The server is currently busy. Please try sending your message again in a moment.'
+        : 'A temporary connection issue occurred. Please try again.';
+      res.write(`data: ${JSON.stringify({ type: 'error', error: friendlyMsg })}\n\n`);
+      return res.end();
+    }
+  });
+
+  // 1B. Standard JSON Chat Endpoint (Non-streaming fallback)
+  app.post('/api/chat', async (req, res) => {
+    try {
+      const { scenarioId, level, history, userMessage, targetLanguageName } = req.body as {
+        scenarioId: string;
+        level: string;
+        history: Array<{ sender: 'user' | 'alex'; text: string }>;
+        userMessage: string;
+        targetLanguageName?: string;
+      };
+
+      if (!userMessage || typeof userMessage !== 'string' || !userMessage.trim()) {
+        return res.status(400).json({ error: 'Message text is required.' });
+      }
+
+      const ai = getAiClient();
+      const { scenarioInfo, levelInfo, prompt } = buildChatPrompts(scenarioId, level, history, userMessage);
+      const transLang = targetLanguageName?.trim();
+
+      const systemInstruction = `You are a friendly American English conversation partner.
+Context: ${scenarioInfo}
+Level: ${levelInfo}
+Reply directly to what the learner actually asked/said (follow their topic even if it changes). Keep replyEnglish concise (1-2 short sentences + 1 short question). Set hasMistake=true only for real English mistakes or non-English words, and give correctedEnglish + 1 short encouraging explanation.${
+        transLang ? ` Also provide replyTranslation in ${transLang}.` : ''
+      }`;
+
+      const schemaProperties: Record<string, { type: Type }> = {
+        replyEnglish: { type: Type.STRING },
+        hasMistake: { type: Type.BOOLEAN },
+        correctedEnglish: { type: Type.STRING },
+        explanation: { type: Type.STRING },
+        suggestedNextReply: { type: Type.STRING },
+      };
+      const requiredFields = [
+        'replyEnglish',
+        'hasMistake',
+        'correctedEnglish',
+        'explanation',
+        'suggestedNextReply',
+      ];
+      if (transLang) {
+        schemaProperties.replyTranslation = { type: Type.STRING };
+        requiredFields.push('replyTranslation');
+      }
+
+      const raceTimeout = <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+        let timer: NodeJS.Timeout;
+        return Promise.race([
+          promise.finally(() => clearTimeout(timer)),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('Request timeout')), ms);
+          }),
+        ]);
+      };
+
+      const response = await raceTimeout(
+        new Promise<Awaited<ReturnType<typeof ai.models.generateContent>>>((resolve, reject) => {
+          let settled = false;
+          let hedgeStarted = false;
+          let failures = 0;
+          let lastErr: unknown = null;
+          let hedgeTimer: NodeJS.Timeout | null = null;
+
+          const launch = (model: string, thinkingLevel: ThinkingLevel) => {
+            ai.models
+              .generateContent({
+                model,
+                contents: prompt,
+                config: {
+                  systemInstruction,
+                  thinkingConfig: { thinkingLevel },
+                  responseMimeType: 'application/json',
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: schemaProperties,
+                    required: requiredFields,
+                  },
+                },
+              })
+              .then((resObj) => {
+                if (settled) return;
+                settled = true;
+                if (hedgeTimer) clearTimeout(hedgeTimer);
+                resolve(resObj);
+              })
+              .catch((err: unknown) => {
+                lastErr = err;
+                failures += 1;
+                if (settled) return;
+                if (!hedgeStarted) {
+                  hedgeStarted = true;
+                  if (hedgeTimer) clearTimeout(hedgeTimer);
+                  launch('gemini-4-hydrogen', ThinkingLevel.LOW);
+                } else if (failures >= 2) {
+                  settled = true;
+                  if (hedgeTimer) clearTimeout(hedgeTimer);
+                  reject(lastErr || new Error('Chat failed'));
+                }
+              });
+          };
+
+          launch('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL);
+          hedgeTimer = setTimeout(() => {
+            if (!settled && !hedgeStarted) {
+              hedgeStarted = true;
+              launch('gemini-4-hydrogen', ThinkingLevel.LOW);
+            }
+          }, 2600);
+        }),
+        10000
+      );
+
+      const parsed = JSON.parse((response.text ?? '{}').trim());
+      return res.json(parsed);
+    } catch (err: unknown) {
+      console.error('Chat error:', err);
+      return res.status(500).json({ error: 'The server is temporarily busy. Please try again.' });
+    }
+  });
+
+  // 2. Generate 5 Key Phrases for the active conversation
+  app.post('/api/phrases', async (req, res) => {
+    try {
+      const { scenarioId, level, recentMessages } = req.body as {
+        scenarioId: string;
+        level: string;
+        recentMessages: Array<{ sender: string; text: string }>;
+      };
+
+      const ai = getAiClient();
+      const scenarioInfo = SCENARIO_CONTEXT[scenarioId] || SCENARIO_CONTEXT.conversation;
+      const levelInfo = LEVEL_INSTRUCTIONS[level] || LEVEL_INSTRUCTIONS.beginner;
+
+      const contextLines = (recentMessages || [])
+        .slice(-4)
+        .map((m) => `${m.sender === 'user' ? 'Learner' : 'Alex'}: ${String(m.text || '').slice(0, 300)}`)
+        .join('\n');
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: `Generate 5 practical spoken English phrases to practice.\nScenario: ${scenarioInfo}\nLevel: ${levelInfo}\nRecent chat:\n${contextLines || 'Opening'}`,
+        config: {
+          systemInstruction:
+            'You are an American English coach. Return exactly 5 useful spoken American English phrases matching the scenario and level, each with a concise simple-English meaning and a brief 1-sentence usage tip in English.',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                english: { type: Type.STRING },
+                meaning: { type: Type.STRING },
+                usageNote: { type: Type.STRING },
+              },
+              required: ['english', 'meaning', 'usageNote'],
+            },
+          },
+        },
+      });
+
+      const items = JSON.parse((response.text ?? '[]').trim()) as Array<{
+        english: string;
+        meaning: string;
+        usageNote: string;
+      }>;
+
+      const phrases = items.slice(0, 5).map((item, idx) => ({
+        id: `gen-${Date.now()}-${idx}`,
+        english: item.english,
+        meaning: item.meaning,
+        usageNote: item.usageNote,
+        memorized: false,
+      }));
+
+      return res.json({ phrases });
+    } catch (err: unknown) {
+      console.error('Phrases error:', err);
+      return res.status(500).json({ error: 'Could not generate new phrases right now. Please try again.' });
+    }
+  });
+
+  // 3A. Progressive Streaming TTS (raw L16 PCM 24kHz mono)
+  app.post('/api/tts/stream', async (req, res) => {
+    try {
+      const { text, level, slow } = req.body as {
+        text: string;
+        level?: string;
+        slow?: boolean;
+      };
+
+      if (!text || typeof text !== 'string' || !text.trim()) {
+        return res.status(400).json({ error: 'Text is required for speech.' });
+      }
+
+      const ai = getAiClient();
+      const shouldSpeakSlow = Boolean(slow);
+      const style = shouldSpeakSlow
+        ? 'Speak clearly and gently at a comfortable pace for an English learner.'
+        : level === 'beginner'
+        ? 'Speak clearly and warmly at a natural, steady pace.'
+        : 'Friendly, upbeat young American man speaking at a brisk, natural conversational pace.';
+
+      let ttsClientClosed = false;
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          ttsClientClosed = true;
+        }
+      });
+
+      const responseStream = await ai.models.generateContentStream({
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: text.slice(0, 1500),
+                speechMetadata: { style },
+              },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Puck' },
+            },
+          },
+        },
+      });
+
+      let headersFlushed = false;
+      for await (const chunk of responseStream) {
+        if (ttsClientClosed) break;
+        const data = chunk.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (data) {
+          if (!headersFlushed) {
+            headersFlushed = true;
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.flushHeaders?.();
+          }
+          res.write(Buffer.from(data, 'base64'));
+        }
+      }
+
+      if (!headersFlushed && !res.headersSent) {
+        return res.status(502).json({ error: 'No audio chunks returned from TTS model.' });
+      }
+      return res.end();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('TTS stream error:', msg);
+      if (!res.headersSent) {
+        const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+        return res.status(isQuota ? 429 : 500).json({ error: 'Failed to stream speech audio.' });
+      }
+      return res.end();
+    }
+  });
+
+  // 3B. Unary Text-to-Speech (WAV fallback)
+  app.post('/api/tts', async (req, res) => {
+    try {
+      const { text, level, slow } = req.body as {
+        text: string;
+        level?: string;
+        slow?: boolean;
+      };
+
+      if (!text || typeof text !== 'string' || !text.trim()) {
+        return res.status(400).json({ error: 'Text is required for speech.' });
+      }
+
+      const ai = getAiClient();
+      const shouldSpeakSlow = Boolean(slow);
+      const style = shouldSpeakSlow
+        ? 'Speak clearly and gently at a comfortable pace for an English learner.'
+        : level === 'beginner'
+        ? 'Speak clearly and warmly at a natural, steady pace.'
+        : 'Friendly, upbeat young American man speaking at a brisk, natural conversational pace.';
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: text.slice(0, 1500),
+                speechMetadata: {
+                  style,
+                },
+              },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Puck' },
+            },
+          },
+        },
+      });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) {
+        return res.status(500).json({ error: 'No audio returned from TTS model.' });
+      }
+
+      return res.json({ audioBase64: base64Audio, mimeType: 'audio/wav' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('TTS error:', msg);
+      const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+      return res.status(isQuota ? 429 : 500).json({ error: 'Failed to synthesize speech audio.' });
+    }
+  });
+
+  // 4. Audio Transcription (Microphone voice input)
+  app.post('/api/transcribe', async (req, res) => {
+    try {
+      const { audioBase64, mimeType } = req.body as {
+        audioBase64: string;
+        mimeType?: string;
+      };
+
+      if (!audioBase64 || typeof audioBase64 !== 'string') {
+        return res.status(400).json({ error: 'Audio data is required.' });
+      }
+
+      const ai = getAiClient();
+      const cleanMime = (mimeType || 'audio/webm').split(';')[0];
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: cleanMime,
+                data: audioBase64,
+              },
+            },
+            {
+              text: 'Transcribe the spoken audio accurately in the exact language spoken. Return ONLY the transcribed text without quotes or commentary. If the audio is silent or unintelligible, return an empty string.',
+            },
+          ],
+        },
+      });
+
+      return res.json({ text: (response.text ?? '').trim() });
+    } catch (err: unknown) {
+      console.error('Transcribe error:', err);
+      return res.status(500).json({ error: 'Failed to transcribe audio.' });
+    }
+  });
+
+  // 5. On-demand Translation to any world language
+  app.post('/api/translate', async (req, res) => {
+    try {
+      const { text, targetLanguageName } = req.body as {
+        text: string;
+        targetLanguageName: string;
+      };
+
+      if (!text || !targetLanguageName || typeof text !== 'string' || typeof targetLanguageName !== 'string') {
+        return res.status(400).json({ error: 'Text and target language are required.' });
+      }
+
+      const ai = getAiClient();
+      const systemInstruction = `Translate the user's English text accurately and naturally into ${targetLanguageName.slice(0, 80)}. Return ONLY the translated text with no quotes, labels, or commentary.`;
+
+      let response;
+      try {
+        response = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: text.slice(0, 2000),
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          },
+        });
+      } catch {
+        response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: text.slice(0, 2000),
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
+      }
+
+      return res.json({ translation: (response.text ?? '').trim() });
+    } catch (err: unknown) {
+      console.error('Translate error:', err);
+      return res.status(500).json({ error: 'Translation is temporarily unavailable. Please try again.' });
+    }
+  });
+
+  if (!isProd) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+  httpServer.keepAliveTimeout = 65000;
+  httpServer.headersTimeout = 66000;
+}
+
+startServer();import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(<App />);@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: "Plus Jakarta Sans", "IBM Plex Sans Arabic", -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-arabic: "IBM Plex Sans Arabic", "Plus Jakarta Sans", sans-serif;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    font-family: var(--font-sans);
+    background-color: #eae6df;
+    color: #111b21;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+.font-arabic {
+  font-family: var(--font-arabic);
+}
+
+/* Subtle WhatsApp-inspired warm chat canvas wallpaper */
+.whatsapp-wallpaper {
+  background-color: #efeae2;
+  background-image: radial-gradient(rgba(17, 27, 33, 0.045) 1px, transparent 1px),
+    radial-gradient(rgba(0, 128, 105, 0.035) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: 0 0, 12px 12px;
+}
+
+/* Custom thin scrollbar for chat & sidebars */
+.chat-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(17, 27, 33, 0.16);
+  border-radius: 9999px;
+}
+
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(17, 27, 33, 0.28);
+}
+
+/* Safe area padding for iOS/Android mobile browsers */
+.pb-safe {
+  padding-bottom: max(0.625rem, env(safe-area-inset-bottom));
+}export type ScenarioId = 'conversation' | 'airport' | 'work' | 'doctor' | 'meeting';
+
+export type ProficiencyLevel = 'beginner' | 'intermediate' | 'advanced';
+
+export interface MistakeCorrection {
+  correctedEnglish: string;
+  explanation: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: 'user' | 'alex';
+  text: string;
+  translations?: Record<string, string>;
+  timestamp: string;
+  correction?: MistakeCorrection;
+  suggestedNextReply?: string;
+}
+
+export interface KeyPhrase {
+  id: string;
+  english: string;
+  meaning: string;
+  usageNote: string;
+  memorized?: boolean;
+}
+
+export interface ScenarioMeta {
+  id: ScenarioId;
+  title: string;
+  subtitle: string;
+  roleDescription: string;
+  accentBg: string;
+  accentText: string;
+}
+
+export interface LevelMeta {
+  id: ProficiencyLevel;
+  label: string;
+  description: string;
+}
+
+export interface ConversationThread {
+  messages: ChatMessage[];
+  phrases: KeyPhrase[];
+  lastUpdated: number;
+}export interface TranslationLanguage {
+  code: string;
+  name: string;
+  nativeName: string;
+  dir: 'rtl' | 'ltr';
+}
+
+export const WORLD_LANGUAGES: TranslationLanguage[] = [
+  { code: 'es', name: 'Spanish', nativeName: 'Español', dir: 'ltr' },
+  { code: 'fr', name: 'French', nativeName: 'Français', dir: 'ltr' },
+  { code: 'ar', name: 'Arabic', nativeName: 'العربية', dir: 'rtl' },
+  { code: 'darija', name: 'Moroccan Darija', nativeName: 'الدارجة المغربية', dir: 'rtl' },
+  { code: 'de', name: 'German', nativeName: 'Deutsch', dir: 'ltr' },
+  { code: 'it', name: 'Italian', nativeName: 'Italiano', dir: 'ltr' },
+  { code: 'pt', name: 'Portuguese', nativeName: 'Português', dir: 'ltr' },
+  { code: 'nl', name: 'Dutch', nativeName: 'Nederlands', dir: 'ltr' },
+  { code: 'tr', name: 'Turkish', nativeName: 'Türkçe', dir: 'ltr' },
+  { code: 'ru', name: 'Russian', nativeName: 'Русский', dir: 'ltr' },
+  { code: 'zh', name: 'Chinese', nativeName: '中文', dir: 'ltr' },
+  { code: 'ja', name: 'Japanese', nativeName: '日本語', dir: 'ltr' },
+  { code: 'ko', name: 'Korean', nativeName: '한국어', dir: 'ltr' },
+  { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी', dir: 'ltr' },
+  { code: 'ur', name: 'Urdu', nativeName: 'اردو', dir: 'rtl' },
+  { code: 'fa', name: 'Persian', nativeName: 'فارسی', dir: 'rtl' },
+  { code: 'id', name: 'Indonesian', nativeName: 'Bahasa Indonesia', dir: 'ltr' },
+  { code: 'ms', name: 'Malay', nativeName: 'Bahasa Melayu', dir: 'ltr' },
+  { code: 'bn', name: 'Bengali', nativeName: 'বাংলা', dir: 'ltr' },
+  { code: 'pl', name: 'Polish', nativeName: 'Polski', dir: 'ltr' },
+  { code: 'sv', name: 'Swedish', nativeName: 'Svenska', dir: 'ltr' },
+  { code: 'no', name: 'Norwegian', nativeName: 'Norsk', dir: 'ltr' },
+  { code: 'da', name: 'Danish', nativeName: 'Dansk', dir: 'ltr' },
+  { code: 'fi', name: 'Finnish', nativeName: 'Suomi', dir: 'ltr' },
+  { code: 'el', name: 'Greek', nativeName: 'Ελληνικά', dir: 'ltr' },
+  { code: 'uk', name: 'Ukrainian', nativeName: 'Українська', dir: 'ltr' },
+  { code: 'ro', name: 'Romanian', nativeName: 'Română', dir: 'ltr' },
+  { code: 'cs', name: 'Czech', nativeName: 'Čeština', dir: 'ltr' },
+  { code: 'hu', name: 'Hungarian', nativeName: 'Magyar', dir: 'ltr' },
+  { code: 'th', name: 'Thai', nativeName: 'ไทย', dir: 'ltr' },
+  { code: 'vi', name: 'Vietnamese', nativeName: 'Tiếng Việt', dir: 'ltr' },
+  { code: 'tl', name: 'Filipino', nativeName: 'Filipino', dir: 'ltr' },
+  { code: 'sw', name: 'Swahili', nativeName: 'Kiswahili', dir: 'ltr' },
+  { code: 'am', name: 'Amharic', nativeName: 'አማርኛ', dir: 'ltr' },
+  { code: 'ha', name: 'Hausa', nativeName: 'Hausa', dir: 'ltr' },
+  { code: 'he', name: 'Hebrew', nativeName: 'עברית', dir: 'rtl' },
+  { code: 'ca', name: 'Catalan', nativeName: 'Català', dir: 'ltr' },
+  { code: 'zgh', name: 'Amazigh (Tamazight)', nativeName: 'Tamaziɣt / ⵜⴰⵎⴰⵣⵉⵖⵜ', dir: 'ltr' },
+  { code: 'en', name: 'Simple English', nativeName: 'Simple English', dir: 'ltr' },
+];import { useCallback, useEffect, useRef, useState } from 'react';
+import { ProficiencyLevel } from '../types';
+
+interface PlayOptions {
+  id: string;
+  text: string;
+  level: ProficiencyLevel;
+  slow?: boolean;
+  liteMode?: boolean;
+}
+
+function pcmBytesToWavBlob(pcmBytes: Uint8Array, sampleRate = 24000): Blob {
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  const dataSize = pcmBytes.byteLength;
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  return new Blob([header, pcmBytes.buffer as ArrayBuffer], { type: 'audio/wav' });
+}
+
+export function useSpeechAudio(onSlowNetwork?: () => void) {
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const cacheRef = useRef<Map<string, string>>(new Map());
+  const speechTimerRef = useRef<number | null>(null);
+
+  const stop = useCallback(() => {
+    if (speechTimerRef.current) {
+      window.clearTimeout(speechTimerRef.current);
+      speechTimerRef.current = null;
+    }
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      audioRef.current = null;
+    }
+    if (activeSourcesRef.current.length > 0) {
+      activeSourcesRef.current.forEach((src) => {
+        try {
+          src.onended = null;
+          src.stop();
+        } catch {
+          // Ignore already-stopped nodes
+        }
+      });
+      activeSourcesRef.current = [];
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setLoadingId(null);
+    setPlayingId(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stop();
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+      }
+      cacheRef.current.forEach((url) => {
+        if (url.startsWith('blob:')) {
+          URL.revokeObjectURL(url);
+        }
+      });
+    };
+  }, [stop]);
+
+  const fallbackSpeak = useCallback((id: string, text: string, slow: boolean) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setAudioError('Speech playback is not supported in this browser.');
+      return;
+    }
+    if (speechTimerRef.current) {
+      window.clearTimeout(speechTimerRef.current);
+      speechTimerRef.current = null;
+    }
+
+    const startSpeech = () => {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en-US';
+      utterance.rate = slow ? 0.78 : 0.98;
+      utterance.onstart = () => setPlayingId(id);
+      utterance.onend = () => setPlayingId((curr) => (curr === id ? null : curr));
+      utterance.onerror = (event) => {
+        setPlayingId((curr) => (curr === id ? null : curr));
+        const errCode = (event as SpeechSynthesisErrorEvent | undefined)?.error;
+        if (errCode !== 'interrupted' && errCode !== 'canceled' && errCode !== 'not-allowed') {
+          setAudioError('Could not play audio right now.');
+        }
+      };
+      try {
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+        window.speechSynthesis.speak(utterance);
+      } catch {
+        setPlayingId((curr) => (curr === id ? null : curr));
+      }
+    };
+
+    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+      window.speechSynthesis.cancel();
+      speechTimerRef.current = window.setTimeout(() => {
+        speechTimerRef.current = null;
+        startSpeech();
+      }, 35);
+    } else {
+      startSpeech();
+    }
+  }, []);
+
+  const unlockAudio = useCallback(() => {
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new AudioCtx({ sampleRate: 24000 });
+      }
+      if (audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    } catch {
+      // Ignore audio unlock errors
+    }
+  }, []);
+
+  const play = useCallback(
+    async ({ id, text, level, slow, liteMode }: PlayOptions) => {
+      setAudioError(null);
+
+      if (playingId === id) {
+        stop();
+        return;
+      }
+
+      stop();
+
+      const useSlow = Boolean(slow);
+      const cacheKey = `${useSlow ? 'slow' : level}:${text}`;
+
+      // 1. Instant replay if cached
+      const cachedUrl = cacheRef.current.get(cacheKey);
+      if (cachedUrl) {
+        const audio = new Audio(cachedUrl);
+        audioRef.current = audio;
+        setPlayingId(id);
+        audio.onended = () => setPlayingId((curr) => (curr === id ? null : curr));
+        audio.onerror = () => {
+          setPlayingId(null);
+          fallbackSpeak(id, text, useSlow);
+        };
+        await audio.play().catch(() => fallbackSpeak(id, text, useSlow));
+        return;
+      }
+
+      // 2. Zero-data instant local speech when liteMode is active
+      if (liteMode) {
+        fallbackSpeak(id, text, useSlow || level === 'beginner');
+        return;
+      }
+
+      // 3. Progressive streaming PCM via AudioContext with fast 1.2s slow-connection timeout
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setLoadingId(id);
+      let timedOut = false;
+      let firstByteTimer: number | null = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 1200);
+
+      try {
+        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) {
+          throw new Error('No AudioContext');
+        }
+
+        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+          audioCtxRef.current = new AudioCtx({ sampleRate: 24000 });
+        }
+        const ctx = audioCtxRef.current;
+        if (ctx.state === 'suspended') {
+          await Promise.race([
+            ctx.resume().catch(() => {}),
+            new Promise<void>((resolve) => window.setTimeout(resolve, 200)),
+          ]);
+        }
+
+        const response = await fetch('/api/tts/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, level, slow: useSlow }),
+          signal: controller.signal,
+        });
+
+        if (response.status === 429 || response.status >= 500) {
+          onSlowNetwork?.();
+          throw new Error('TTS unavailable');
+        }
+
+        if (!response.ok || !response.body) {
+          throw new Error('Streaming TTS failed');
+        }
+
+        const reader = response.body.getReader();
+        const collectedChunks: Uint8Array[] = [];
+        let leftover: Uint8Array = new Uint8Array(0);
+        let nextPlayTime = ctx.currentTime + 0.04;
+        let started = false;
+        let scheduledCount = 0;
+
+        while (true) {
+          let readTimer: number | null = window.setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, 3500);
+          const { value, done } = await reader.read().finally(() => {
+            if (readTimer !== null) {
+              window.clearTimeout(readTimer);
+              readTimer = null;
+            }
+          });
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+
+          if (firstByteTimer !== null) {
+            window.clearTimeout(firstByteTimer);
+            firstByteTimer = null;
+          }
+
+          // Combine leftover odd byte (if any) with incoming chunk
+          const combined = new Uint8Array(leftover.length + value.length);
+          combined.set(leftover, 0);
+          combined.set(value, leftover.length);
+
+          const evenLen = combined.length - (combined.length % 2);
+          leftover = combined.slice(evenLen);
+
+          if (evenLen === 0) continue;
+
+          const pcmSlice = combined.slice(0, evenLen);
+          collectedChunks.push(pcmSlice);
+
+          const sampleCount = evenLen / 2;
+          const floatSamples = new Float32Array(sampleCount);
+          const dataView = new DataView(pcmSlice.buffer, pcmSlice.byteOffset, pcmSlice.byteLength);
+          for (let i = 0; i < sampleCount; i++) {
+            floatSamples[i] = dataView.getInt16(i * 2, true) / 32768;
+          }
+
+          const audioBuffer = ctx.createBuffer(1, sampleCount, 24000);
+          audioBuffer.copyToChannel(floatSamples, 0);
+
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ctx.destination);
+
+          if (nextPlayTime < ctx.currentTime) {
+            nextPlayTime = ctx.currentTime + 0.01;
+          }
+
+          if (!started) {
+            started = true;
+            setLoadingId(null);
+            setPlayingId(id);
+          }
+
+          scheduledCount += 1;
+          activeSourcesRef.current.push(source);
+
+          source.onended = () => {
+            activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source);
+            if (activeSourcesRef.current.length === 0 && abortRef.current === null) {
+              setPlayingId((curr) => (curr === id ? null : curr));
+            }
+          };
+
+          source.start(nextPlayTime);
+          nextPlayTime += audioBuffer.duration;
+        }
+
+        if (firstByteTimer !== null) {
+          window.clearTimeout(firstByteTimer);
+          firstByteTimer = null;
+        }
+        abortRef.current = null;
+        setLoadingId(null);
+
+        if (scheduledCount === 0) {
+          throw new Error('No audio chunks received');
+        }
+
+        // Cache complete WAV for instant zero-latency replay later
+        const totalBytes = collectedChunks.reduce((acc, c) => acc + c.byteLength, 0);
+        const fullPcm = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of collectedChunks) {
+          fullPcm.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const wavBlob = pcmBytesToWavBlob(fullPcm, 24000);
+        cacheRef.current.set(cacheKey, URL.createObjectURL(wavBlob));
+      } catch (err: unknown) {
+        if (firstByteTimer !== null) {
+          window.clearTimeout(firstByteTimer);
+          firstByteTimer = null;
+        }
+        if (err instanceof DOMException && err.name === 'AbortError' && !timedOut) {
+          return;
+        }
+        abortRef.current = null;
+        setLoadingId(null);
+        if (timedOut) {
+          onSlowNetwork?.();
+        }
+        fallbackSpeak(id, text, useSlow || level === 'beginner');
+      }
+    },
+    [fallbackSpeak, onSlowNetwork, playingId, stop]
+  );
+
+  return {
+    loadingId,
+    playingId,
+    audioError,
+    play,
+    stop,
+    unlockAudio,
+  };
+}import React from 'react';
+import { Briefcase, MessageSquare, Plane, Stethoscope, Users } from 'lucide-react';
+import { APP_LOGO_URL, LEVELS, SCENARIOS } from '../data/scenarios';
+import { ConversationThread, ProficiencyLevel, ScenarioId } from '../types';
+
+interface SidebarProps {
+  activeScenario: ScenarioId;
+  activeLevel: ProficiencyLevel;
+  threads: Record<string, ConversationThread>;
+  onSelectScenario: (id: ScenarioId) => void;
+  onSelectLevel: (level: ProficiencyLevel) => void;
+}
+
+const SCENARIO_ICONS: Record<ScenarioId, React.ComponentType<{ className?: string }>> = {
+  conversation: MessageSquare,
+  airport: Plane,
+  work: Briefcase,
+  doctor: Stethoscope,
+  meeting: Users,
+};
+
+export const Sidebar: React.FC<SidebarProps> = ({
+  activeScenario,
+  activeLevel,
+  threads,
+  onSelectScenario,
+  onSelectLevel,
+}) => {
+  const [imgError, setImgError] = React.useState(false);
+  const currentLevelMeta = LEVELS.find((l) => l.id === activeLevel) || LEVELS[0];
+
+  return (
+    <aside className="flex flex-col h-full w-full bg-white border-r border-black/10 select-none">
+      {/* Top App Bar */}
+      <div className="h-14 px-4 bg-[#F0F2F5] border-b border-black/8 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-3 min-w-0">
+          {imgError ? (
+            <div className="w-9 h-9 rounded-xl bg-[#008069] text-white font-bold text-xs flex items-center justify-center border border-black/10 shrink-0">
+              LE
+            </div>
+          ) : (
+            <img
+              src={APP_LOGO_URL}
+              alt="Learn English via Conversation"
+              referrerPolicy="no-referrer"
+              onError={() => setImgError(true)}
+              className="w-9 h-9 rounded-xl object-cover border border-black/10 shrink-0 bg-white"
+            />
+          )}
+          <div className="min-w-0">
+            <h1 className="text-[14px] font-bold text-[#111B21] leading-tight truncate">
+              Learn English via Conversation
+            </h1>
+            <p className="text-[11px] text-[#667781] truncate">
+              Interactive Speaking Practice
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Level Selector (3 Levels) */}
+      <div className="px-3.5 py-3 bg-[#F7F8FA] border-b border-black/8 shrink-0">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <span className="text-xs font-semibold text-[#111B21]">Your Level</span>
+          <span className="text-[11px] text-[#008069] font-medium truncate">
+            {currentLevelMeta.description}
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-1 p-1 bg-[#E9EDEF] rounded-xl">
+          {LEVELS.map((lvl) => {
+            const isActive = lvl.id === activeLevel;
+            return (
+              <button
+                key={lvl.id}
+                type="button"
+                onClick={() => onSelectLevel(lvl.id)}
+                className={`min-h-[40px] px-2 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap cursor-pointer ${
+                  isActive
+                    ? 'bg-white text-[#008069] shadow-xs'
+                    : 'text-[#54656F] hover:text-[#111B21]'
+                }`}
+              >
+                {lvl.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Scenarios List */}
+      <div className="px-4 pt-3 pb-1.5 bg-white shrink-0">
+        <p className="text-xs font-semibold text-[#667781]">
+          Choose a topic to practice
+        </p>
+      </div>
+
+      <div className="flex-1 overflow-y-auto chat-scroll bg-white">
+        {SCENARIOS.map((scenario) => {
+          const Icon = SCENARIO_ICONS[scenario.id];
+          const isSelected = scenario.id === activeScenario;
+          const threadKey = `${scenario.id}:${activeLevel}`;
+          const thread = threads[threadKey];
+          const lastMsg = thread?.messages?.[thread.messages.length - 1];
+          const msgCount = thread?.messages?.length || 0;
+
+          return (
+            <button
+              key={scenario.id}
+              type="button"
+              onClick={() => onSelectScenario(scenario.id)}
+              className={`w-full text-left px-4 py-3.5 min-h-[72px] flex items-center gap-3.5 border-b border-black/5 transition-colors cursor-pointer ${
+                isSelected ? 'bg-[#F0F2F5]' : 'hover:bg-[#F5F6F6]'
+              }`}
+            >
+              <div
+                className={`w-11 h-11 rounded-full flex items-center justify-center shrink-0 ${scenario.accentBg} ${scenario.accentText}`}
+              >
+                <Icon className="w-5 h-5" />
+              </div>
+
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[14.5px] font-semibold text-[#111B21] truncate">
+                    {scenario.title}
+                  </span>
+                  {lastMsg ? (
+                    <span className="text-[11px] text-[#667781] tabular-nums shrink-0">
+                      {lastMsg.timestamp}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="flex items-center justify-between gap-2 mt-0.5">
+                  <p className="text-xs text-[#667781] truncate">
+                    {lastMsg ? lastMsg.text : scenario.subtitle}
+                  </p>
+                  {msgCount > 0 && (
+                    <span className="text-[11px] font-medium text-[#008069] tabular-nums shrink-0">
+                      {msgCount}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </aside>
+  );
+};import React, { useState } from 'react';
+import { ArrowLeft, BookOpen, RotateCcw, Volume2, VolumeX, Wifi } from 'lucide-react';
+import { APP_LOGO_URL, LEVELS, SCENARIOS } from '../data/scenarios';
+import { ProficiencyLevel, ScenarioId } from '../types';
+
+interface ChatHeaderProps {
+  scenarioId: ScenarioId;
+  level: ProficiencyLevel;
+  isTyping: boolean;
+  autoSpeak: boolean;
+  liteMode: boolean;
+  memorizedCount: number;
+  totalPhrases: number;
+  onBackToScenarios: () => void;
+  onOpenPhrases: () => void;
+  onToggleAutoSpeak: () => void;
+  onToggleLiteMode: () => void;
+  onResetChat: () => void;
+}
+
+export const ChatHeader: React.FC<ChatHeaderProps> = ({
+  scenarioId,
+  level,
+  isTyping,
+  autoSpeak,
+  liteMode,
+  memorizedCount,
+  totalPhrases,
+  onBackToScenarios,
+  onOpenPhrases,
+  onToggleAutoSpeak,
+  onToggleLiteMode,
+  onResetChat,
+}) => {
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [imgError, setImgError] = useState(false);
+
+  const scenario = SCENARIOS.find((s) => s.id === scenarioId) || SCENARIOS[0];
+  const levelMeta = LEVELS.find((l) => l.id === level) || LEVELS[0];
+
+  return (
+    <header className="h-14 px-2 sm:px-4 bg-[#F0F2F5] border-b border-black/10 flex items-center justify-between gap-2 shrink-0 sticky top-0 z-20">
+      {/* Left Group: Back button (mobile) + Logo + Title */}
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+        <button
+          type="button"
+          onClick={onBackToScenarios}
+          aria-label="Back to topics"
+          className="md:hidden min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-[#54656F] hover:bg-black/5 active:bg-black/10 transition-colors cursor-pointer shrink-0"
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+
+        <div className="relative shrink-0">
+          {imgError ? (
+            <div className="w-10 h-10 rounded-xl bg-[#008069] text-white font-bold text-xs flex items-center justify-center border border-black/10">
+              LE
+            </div>
+          ) : (
+            <img
+              src={APP_LOGO_URL}
+              alt="Learn English via Conversation"
+              referrerPolicy="no-referrer"
+              onError={() => setImgError(true)}
+              className="w-10 h-10 rounded-xl object-cover border border-black/10 bg-white"
+            />
+          )}
+        </div>
+
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <h2 className="text-[14.5px] font-semibold text-[#111B21] truncate">
+              {scenario.id === 'conversation' ? 'Learn English via Conversation' : scenario.title}
+            </h2>
+          </div>
+          <p className="text-[11px] text-[#667781] truncate">
+            {isTyping ? (
+              <span className="text-[#008069] font-medium">Replying</span>
+            ) : (
+              <span>
+                {levelMeta.label} · English Practice
+              </span>
+            )}
+          </p>
+        </div>
+      </div>
+
+      {/* Right Group: Lite mode + Auto-speak + 5 Phrases Drawer + Reset */}
+      <div className="flex items-center gap-1 shrink-0">
+        <button
+          type="button"
+          onClick={onToggleLiteMode}
+          title={liteMode ? 'Lite mode enabled (local speech, low data)' : 'Enable Lite mode for slow connections'}
+          aria-label="Toggle Lite mode"
+          className={`min-h-[40px] px-2.5 rounded-xl border transition-colors flex items-center gap-1 text-xs font-semibold whitespace-nowrap cursor-pointer ${
+            liteMode
+              ? 'bg-amber-50 border-amber-300 text-amber-800'
+              : 'bg-white border-black/10 text-[#667781] hover:bg-[#F7F8FA]'
+          }`}
+        >
+          <Wifi className="w-3.5 h-3.5 shrink-0" />
+          <span className="hidden sm:inline">{liteMode ? 'Lite' : 'HD'}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onToggleAutoSpeak}
+          title={autoSpeak ? 'Auto-speak enabled' : 'Auto-speak muted'}
+          aria-label={autoSpeak ? 'Mute auto-speak' : 'Enable auto-speak'}
+          className={`min-h-[40px] px-2.5 rounded-xl border transition-colors flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap cursor-pointer ${
+            autoSpeak
+              ? 'bg-[#E7FCE3] border-[#008069]/25 text-[#008069]'
+              : 'bg-white border-black/10 text-[#667781] hover:bg-[#F7F8FA]'
+          }`}
+        >
+          {autoSpeak ? (
+            <Volume2 className="w-4 h-4 shrink-0" />
+          ) : (
+            <VolumeX className="w-4 h-4 shrink-0" />
+          )}
+          <span className="hidden sm:inline">{autoSpeak ? 'Auto' : 'Muted'}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenPhrases}
+          className="xl:hidden min-h-[40px] px-2.5 sm:px-3 rounded-xl bg-white border border-black/10 text-[#008069] hover:bg-[#F7F8FA] active:scale-[0.98] transition-all flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap cursor-pointer"
+        >
+          <BookOpen className="w-4 h-4 shrink-0" />
+          <span>5 Phrases</span>
+          <span className="text-[#667781] tabular-nums">
+            {memorizedCount}/{totalPhrases}
+          </span>
+        </button>
+
+        {confirmReset ? (
+          <div className="flex items-center gap-1 bg-white border border-black/10 rounded-xl p-1">
+            <button
+              type="button"
+              onClick={() => {
+                onResetChat();
+                setConfirmReset(false);
+              }}
+              className="px-2.5 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 rounded-lg whitespace-nowrap cursor-pointer"
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmReset(false)}
+              className="px-2.5 py-1.5 text-xs font-medium text-[#54656F] hover:bg-black/5 rounded-lg whitespace-nowrap cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setConfirmReset(true)}
+            title="New conversation"
+            aria-label="New conversation"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-[#54656F] hover:bg-black/5 active:bg-black/10 transition-colors cursor-pointer"
+          >
+            <RotateCcw className="w-[18px] h-[18px]" />
+          </button>
+        )}
+      </div>
+    </header>
+  );
+};import React, { useEffect, useRef, useState } from 'react';
+import { Lightbulb, Mic, Send, Square, Trash2 } from 'lucide-react';
+
+interface ChatComposerProps {
+  inputText: string;
+  setInputText: (val: string) => void;
+  disabled: boolean;
+  suggestedHint?: string;
+  onSendMessage: (text: string) => void;
+}
+
+export const ChatComposer: React.FC<ChatComposerProps> = ({
+  inputText,
+  setInputText,
+  disabled,
+  suggestedHint,
+  onSendMessage,
+}) => {
+  const [showHint, setShowHint] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearInterval(timerRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
+
+  const formatTimer = (secs: number) => {
+    const mins = Math.floor(secs / 60);
+    const rem = secs % 60;
+    return `${mins}:${rem.toString().padStart(2, '0')}`;
+  };
+
+  const cleanupStream = () => {
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    mediaRecorderRef.current = null;
+  };
+
+  const startRecording = async () => {
+    setMicError(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setMicError('Microphone is not supported in this browser.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/mp4')
+        ? 'audio/mp4'
+        : '';
+
+      const recorder = preferredMime
+        ? new MediaRecorder(stream, { mimeType: preferredMime, audioBitsPerSecond: 24000 })
+        : new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+
+      chunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+      setRecordingSeconds(0);
+
+      timerRef.current = window.setInterval(() => {
+        setRecordingSeconds((s) => s + 1);
+      }, 1000);
+    } catch {
+      cleanupStream();
+      setMicError('Please allow microphone access in your browser to speak.');
+    }
+  };
+
+  const cancelRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.onstop = null;
+      mediaRecorderRef.current.stop();
+    }
+    chunksRef.current = [];
+    cleanupStream();
+    setIsRecording(false);
+    setRecordingSeconds(0);
+  };
+
+  const finishAndTranscribe = () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+
+    recorder.onstop = async () => {
+      const mimeType = recorder.mimeType || 'audio/webm';
+      const blob = new Blob(chunksRef.current, { type: mimeType });
+      chunksRef.current = [];
+      cleanupStream();
+      setIsRecording(false);
+      setRecordingSeconds(0);
+
+      if (blob.size < 400) {
+        setMicError('Could not hear clearly. Please try speaking again.');
+        return;
+      }
+
+      setIsTranscribing(true);
+      try {
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const result = typeof reader.result === 'string' ? reader.result : '';
+            const idx = result.indexOf(',');
+            resolve(idx >= 0 ? result.slice(idx + 1) : result);
+          };
+          reader.onerror = () => reject(new Error('Failed to read audio'));
+          reader.readAsDataURL(blob);
+        });
+
+        const response = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioBase64: base64, mimeType }),
+          signal: AbortSignal.timeout(15000),
+        });
+
+        const data = (await response.json()) as { text?: string; error?: string };
+        if (!response.ok) {
+          throw new Error(data.error || 'Transcription error');
+        }
+
+        const transcript = (data.text || '').trim();
+        if (!transcript) {
+          setMicError('No speech detected. Please speak closer to the microphone.');
+        } else {
+          setInputText(inputText ? `${inputText} ${transcript}` : transcript);
+          inputRef.current?.focus();
+        }
+      } catch {
+        setMicError('Could not transcribe audio. Please try again.');
+      } finally {
+        setIsTranscribing(false);
+      }
+    };
+
+    recorder.stop();
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = inputText.trim();
+    if (!trimmed || disabled || isRecording || isTranscribing) return;
+    setShowHint(false);
+    setMicError(null);
+    onSendMessage(trimmed);
+  };
+
+  return (
+    <div className="bg-[#F0F2F5] border-t border-black/10 px-2.5 sm:px-4 py-2 pb-safe shrink-0">
+      {/* Inline Hint Drawer */}
+      {showHint && suggestedHint && (
+        <div className="mb-2 bg-white border border-black/8 rounded-xl px-3 py-2 flex items-center justify-between gap-2 shadow-xs">
+          <div className="min-w-0">
+            <span className="text-[11px] font-semibold text-[#008069] block">
+              Suggested reply:
+            </span>
+            <p className="text-sm text-[#111B21] truncate">
+              {suggestedHint}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setInputText(suggestedHint);
+              setShowHint(false);
+              inputRef.current?.focus();
+            }}
+            className="px-3 py-1.5 rounded-lg bg-[#E7FCE3] text-[#008069] text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer hover:bg-[#D9FDD3]"
+          >
+            Use
+          </button>
+        </div>
+      )}
+
+      {/* Microphone Error Banner */}
+      {micError && (
+        <div className="mb-2 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl px-3 py-1.5 text-xs flex items-center justify-between gap-2">
+          <span>{micError}</span>
+          <button
+            type="button"
+            onClick={() => setMicError(null)}
+            className="text-rose-700 font-semibold px-2 py-0.5 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Active Voice Recording Bar vs Standard Composer */}
+      {isRecording ? (
+        <div className="flex items-center justify-between gap-2 bg-white rounded-2xl px-3 py-1.5 min-h-[48px] border border-rose-200">
+          <button
+            type="button"
+            onClick={cancelRecording}
+            aria-label="Cancel recording"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+          >
+            <Trash2 className="w-5 h-5" />
+          </button>
+
+          <div className="flex items-center gap-2 flex-1 justify-center">
+            <Mic className="w-4 h-4 text-rose-500 shrink-0" />
+            <span className="text-sm font-semibold text-[#111B21] tabular-nums">
+              {formatTimer(recordingSeconds)}
+            </span>
+            <span className="text-xs text-[#667781] truncate">
+              Speak in English now
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={finishAndTranscribe}
+            className="min-h-[44px] px-4 rounded-xl bg-[#008069] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-[#006E5A] active:scale-[0.98] transition-all cursor-pointer whitespace-nowrap"
+          >
+            <Square className="w-3.5 h-3.5 fill-current" />
+            <span>Done</span>
+          </button>
+        </div>
+      ) : (
+        <form onSubmit={handleSubmit} className="flex items-center gap-1.5 sm:gap-2">
+          {suggestedHint && (
+            <button
+              type="button"
+              onClick={() => setShowHint((v) => !v)}
+              title="Suggested reply"
+              aria-label="Suggested reply"
+              className={`min-w-[44px] min-h-[44px] rounded-full flex items-center justify-center transition-colors shrink-0 cursor-pointer ${
+                showHint
+                  ? 'bg-[#E7FCE3] text-[#008069]'
+                  : 'text-[#54656F] hover:bg-black/5'
+              }`}
+            >
+              <Lightbulb className="w-5 h-5" />
+            </button>
+          )}
+
+          <div className="flex-1 min-w-0 relative">
+            <input
+              ref={inputRef}
+              type="text"
+              dir="auto"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              disabled={isTranscribing}
+              placeholder={
+                isTranscribing
+                  ? 'Transcribing your voice'
+                  : 'Type in English or tap the mic'
+              }
+              className="w-full min-h-[44px] bg-white rounded-2xl px-4 py-2.5 text-[15px] text-[#111B21] placeholder:text-[#667781] border border-black/8 focus:outline-none focus:border-[#008069]"
+            />
+          </div>
+
+          {/* Microphone Button */}
+          <button
+            type="button"
+            onClick={startRecording}
+            disabled={disabled || isTranscribing}
+            title="Speak with microphone"
+            aria-label="Speak with microphone"
+            className="min-w-[44px] min-h-[44px] rounded-full bg-white border border-black/10 text-[#008069] hover:bg-[#E7FCE3] active:scale-[0.96] disabled:opacity-50 flex items-center justify-center transition-all shrink-0 cursor-pointer"
+          >
+            <Mic className={`w-5 h-5 ${isTranscribing ? 'animate-pulse' : ''}`} />
+          </button>
+
+          {/* Send Button */}
+          <button
+            type="submit"
+            disabled={!inputText.trim() || disabled || isTranscribing}
+            title="Send"
+            aria-label="Send message"
+            className="min-w-[44px] min-h-[44px] rounded-full bg-[#008069] text-white hover:bg-[#006E5A] active:scale-[0.96] disabled:bg-[#B8C4C9] disabled:cursor-not-allowed flex items-center justify-center transition-all shrink-0 cursor-pointer"
+          >
+            <Send className="w-5 h-5" />
+          </button>
+        </form>
+      )}
+    </div>
+  );
+};import React from 'react';
+import {
+  BookOpen,
+  Check,
+  CornerDownLeft,
+  RefreshCw,
+  Square,
+  Volume2,
+  X,
+} from 'lucide-react';
+import { KeyPhrase, ProficiencyLevel } from '../types';
+
+interface PhrasesPanelProps {
+  phrases: KeyPhrase[];
+  level: ProficiencyLevel;
+  isGenerating: boolean;
+  playingId: string | null;
+  loadingAudioId: string | null;
+  onPlayAudio: (opts: { id: string; text: string; level: ProficiencyLevel; slow?: boolean }) => void;
+  onToggleMemorized: (phraseId: string) => void;
+  onUseInChat: (english: string) => void;
+  onRefreshPhrases: () => void;
+  onCloseMobile?: () => void;
+}
+
+export const PhrasesPanel: React.FC<PhrasesPanelProps> = ({
+  phrases,
+  level,
+  isGenerating,
+  playingId,
+  loadingAudioId,
+  onPlayAudio,
+  onToggleMemorized,
+  onUseInChat,
+  onRefreshPhrases,
+  onCloseMobile,
+}) => {
+  const memorizedCount = phrases.filter((p) => p.memorized).length;
+
+  return (
+    <div className="flex flex-col h-full bg-[#F7F8FA]">
+      {/* Header */}
+      <div className="h-14 px-4 bg-[#F0F2F5] border-b border-black/10 flex items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <BookOpen className="w-4 h-4 text-[#008069] shrink-0" />
+          <h3 className="text-[15px] font-bold text-[#111B21] truncate">
+            5 Key Phrases
+          </h3>
+          <span className="text-xs font-medium text-[#667781] tabular-nums shrink-0">
+            {memorizedCount}/{phrases.length}
+          </span>
+        </div>
+
+        {onCloseMobile && (
+          <button
+            type="button"
+            onClick={onCloseMobile}
+            aria-label="Close"
+            className="min-w-[44px] min-h-[44px] -mr-2 flex items-center justify-center rounded-full text-[#54656F] hover:bg-black/5 cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        )}
+      </div>
+
+      {/* Refresh Phrases Action */}
+      <div className="px-4 py-3 border-b border-black/8 bg-white flex items-center justify-between gap-2 shrink-0">
+        <p className="text-xs text-[#667781]">
+          Practice and use these in chat
+        </p>
+        <button
+          type="button"
+          onClick={onRefreshPhrases}
+          disabled={isGenerating}
+          className="min-h-[36px] px-3 py-1.5 rounded-xl bg-[#E7FCE3] text-[#008069] hover:bg-[#D9FDD3] disabled:opacity-60 text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${isGenerating ? 'animate-pulse' : ''}`} />
+          <span>New Phrases</span>
+        </button>
+      </div>
+
+      {/* 5 Phrase Cards */}
+      <div className="flex-1 overflow-y-auto chat-scroll p-3.5 space-y-3">
+        {phrases.map((phrase, index) => {
+          const audioId = `phrase-${phrase.id}`;
+          const isPlaying = playingId === audioId;
+          const isLoading = loadingAudioId === audioId;
+
+          return (
+            <div
+              key={phrase.id}
+              className={`rounded-2xl p-3.5 border transition-colors ${
+                phrase.memorized
+                  ? 'bg-[#F0FDF4] border-[#008069]/30'
+                  : 'bg-white border-black/8'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2 mb-1.5">
+                <span className="text-[11px] font-semibold text-[#667781] tabular-nums">
+                  0{index + 1}.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onToggleMemorized(phrase.id)}
+                  className={`min-h-[32px] px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer ${
+                    phrase.memorized
+                      ? 'bg-[#008069] text-white'
+                      : 'bg-[#F0F2F5] text-[#54656F] hover:bg-[#E2E6EA]'
+                  }`}
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{phrase.memorized ? 'Memorized' : 'Mark memorized'}</span>
+                </button>
+              </div>
+
+              <p className="text-[15px] font-semibold text-[#111B21] leading-snug mb-1.5">
+                {phrase.english}
+              </p>
+
+              <p className="text-[13px] font-medium text-[#008069] leading-snug mb-1">
+                {phrase.meaning}
+              </p>
+
+              <p className="text-xs text-[#667781] leading-relaxed mb-3">
+                {phrase.usageNote}
+              </p>
+
+              <div className="flex items-center gap-2 pt-2 border-t border-black/6">
+                <button
+                  type="button"
+                  onClick={() =>
+                    onPlayAudio({
+                      id: audioId,
+                      text: phrase.english,
+                      level,
+                      slow: level === 'beginner',
+                    })
+                  }
+                  className={`flex-1 min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    isPlaying
+                      ? 'bg-[#008069] text-white'
+                      : 'bg-[#F0F2F5] text-[#111B21] hover:bg-[#E2E6EA]'
+                  }`}
+                >
+                  {isLoading ? (
+                    <Volume2 className="w-3.5 h-3.5 text-[#008069] animate-pulse" />
+                  ) : isPlaying ? (
+                    <Square className="w-3 h-3 fill-current" />
+                  ) : (
+                    <Volume2 className="w-3.5 h-3.5 text-[#008069]" />
+                  )}
+                  <span>{isPlaying ? 'Stop' : 'Listen'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onUseInChat(phrase.english)}
+                  className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-[#F0F2F5] text-[#111B21] hover:bg-[#E2E6EA] text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <CornerDownLeft className="w-3.5 h-3.5 text-[#008069]" />
+                  <span>Use in chat</span>
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
